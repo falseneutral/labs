@@ -48,6 +48,16 @@
       linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%);
     background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
   a.dl { color: var(--accent); }
+  .linkish { background: none; border: none; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; }
+  .batch-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin: 8px 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 13px; }
+  td.name { word-break: break-all; }
+  td.state { color: var(--muted); white-space: nowrap; }
+  td.state.ok { color: var(--text); }
+  td.state.err { color: var(--error); }
+  tr:last-child td { border-bottom: none; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -87,10 +97,13 @@
       <input id="edges" type="checkbox" checked> Only from edges
     </label>
     <button id="go" class="primary" disabled>Upscale</button>
+    <button id="stop" hidden>Stop after this image</button>
   </div>
 
-  <div id="drop">Drop image here or click to choose<br><small>PNG, JPG, WebP</small></div>
-  <input id="file" type="file" accept="image/*" hidden>
+  <div id="drop">Drop images or a folder here, or click to choose files<br><small>PNG, JPG, WebP</small></div>
+  <p class="sub" style="margin:8px 0 0"><button id="pickFolder" class="linkish">Choose a whole folder</button></p>
+  <input id="file" type="file" accept="image/*" multiple hidden>
+  <input id="folder" type="file" webkitdirectory hidden>
   <div id="status" class="status"></div>
   <progress id="bar" max="1" value="0" hidden></progress>
 
@@ -108,10 +121,23 @@
       <div class="checker" style="border-radius:6px"><img id="full" alt="Upscaled result"></div>
     </figure>
   </div>
+
+  <div id="batch" hidden>
+    <div class="batch-head">
+      <strong id="batchSummary"></strong>
+      <button id="zip" class="primary" disabled>Download all (ZIP)</button>
+    </div>
+    <table>
+      <thead><tr><th>File</th><th>Size</th><th>Status</th><th></th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let file = null;
+const IMAGE_EXT = /\.(png|jpe?g|webp|bmp|tiff?|gif)$/i;
+let files = [];      // [{file, path}]
+let stopRequested = false;
 
 fetch("/api/info").then(r => r.json()).then(i => {
   $("status").textContent = `Ready · running on ${i.device.toUpperCase()}`;
@@ -122,38 +148,78 @@ $("bg").onchange = () => document.querySelectorAll(".colour-opt")
   .forEach(el => el.hidden = $("bg").value !== "color");
 $("tol").oninput = () => $("tolVal").textContent = $("tol").value;
 $("drop").onclick = () => $("file").click();
-$("file").onchange = e => pick(e.target.files[0]);
+$("pickFolder").onclick = () => $("folder").click();
+$("file").onchange = e => pick([...e.target.files].map(f => ({ file: f, path: f.name })));
+$("folder").onchange = e => pick([...e.target.files].map(f => ({ file: f, path: f.webkitRelativePath || f.name })));
 ["dragover", "dragenter"].forEach(t => $("drop").addEventListener(t, e => { e.preventDefault(); $("drop").classList.add("over"); }));
 ["dragleave", "drop"].forEach(t => $("drop").addEventListener(t, e => { e.preventDefault(); $("drop").classList.remove("over"); }));
-$("drop").addEventListener("drop", e => pick(e.dataTransfer.files[0]));
+$("drop").addEventListener("drop", async e => {
+  const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  pick(entries.length ? await readEntries(entries) : [...e.dataTransfer.files].map(f => ({ file: f, path: f.name })));
+});
 $("split").oninput = e => $("compare").style.setProperty("--split", e.target.value + "%");
+$("stop").onclick = () => { stopRequested = true; $("stop").disabled = true; };
+
+// Walk dropped folders recursively.
+async function readEntries(entries) {
+  const out = [];
+  async function walk(entry) {
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      out.push({ file, path: entry.fullPath.replace(/^\//, "") });
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      let batch;
+      do {
+        batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+        for (const child of batch) await walk(child);
+      } while (batch.length);
+    }
+  }
+  for (const entry of entries) await walk(entry);
+  return out;
+}
 
 function fmt(s) {
   return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
 }
 
-function pick(f) {
-  if (!f || !f.type.startsWith("image/")) return;
-  file = f;
-  $("drop").textContent = `${f.name} · ${(f.size / 1024).toFixed(0)} KB`;
-  $("go").disabled = false;
+function kb(bytes) {
+  return bytes > 1e6 ? `${(bytes / 1e6).toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
 }
 
-$("go").onclick = async () => {
+function pick(list) {
+  list = list.filter(f => f.file.type.startsWith("image/") || IMAGE_EXT.test(f.file.name))
+             .filter(f => !f.file.name.startsWith("."))
+             .sort((a, b) => a.path.localeCompare(b.path));
+  if (!list.length) return;
+  files = list;
+  const total = list.reduce((n, f) => n + f.file.size, 0);
+  $("drop").textContent = list.length === 1
+    ? `${list[0].path} · ${kb(total)}`
+    : `${list.length} images · ${kb(total)}`;
+  $("go").textContent = list.length === 1 ? "Upscale" : `Upscale ${list.length} images`;
+  $("go").disabled = false;
+  $("result").hidden = true;
+  $("batch").hidden = true;
+}
+
+function settings() {
+  return {
+    model: $("model").value, scale: $("scale").value, bg: $("bg").value,
+    bg_color: $("bgColor").value, tolerance: $("tol").value,
+    edges_only: $("edges").checked ? "1" : "0",
+  };
+}
+
+// Upscale one file, reporting progress via onStatus(text, done, total).
+async function runOne(file, opts, onStatus) {
   const fd = new FormData();
   fd.append("image", file);
-  fd.append("model", $("model").value);
-  fd.append("scale", $("scale").value);
-  fd.append("bg", $("bg").value);
-  fd.append("bg_color", $("bgColor").value);
-  fd.append("tolerance", $("tol").value);
-  fd.append("edges_only", $("edges").checked ? "1" : "0");
+  for (const [k, v] of Object.entries(opts)) fd.append(k, v);
   const job = Math.random().toString(36).slice(2);
   fd.append("job", job);
-  $("go").disabled = true;
-  $("status").className = "status";
   const t0 = performance.now();
-  $("bar").hidden = false; $("bar").removeAttribute("value");
   let running = true;
   const tick = setInterval(async () => {
     const secs = ((performance.now() - t0) / 1000).toFixed(0);
@@ -161,12 +227,11 @@ $("go").onclick = async () => {
     try { p = await (await fetch(`/api/progress/${job}`)).json(); } catch {}
     if (!running) return;
     if (p.total) {
-      $("bar").max = p.total; $("bar").value = p.done;
-      $("status").textContent = `Upscaling… ${Math.round(100 * p.done / p.total)}% · tile ${p.done}/${p.total} · ~${fmt(p.eta)} left`;
+      onStatus(`${Math.round(100 * p.done / p.total)}% · tile ${p.done}/${p.total} · ~${fmt(p.eta)} left`, p.done, p.total);
     } else {
       const stage = { "loading model": "Loading model (first run downloads it)",
-                      "removing background": "Removing background (first AI run downloads 170 MB)" }[p.stage] || "Starting";
-      $("status").textContent = `${stage}… ${secs}s`;
+                      "removing background": "Removing background" }[p.stage] || "Starting";
+      onStatus(`${stage}… ${secs}s`);
     }
   }, 1000);
   try {
@@ -175,27 +240,183 @@ $("go").onclick = async () => {
       const html = await r.text();
       throw new Error(html.match(/<p>(.*?)<\/p>/s)?.[1] || r.statusText);
     }
-    const blob = await r.blob();
-    const url = URL.createObjectURL(blob);
+    const name = (r.headers.get("Content-Disposition") || "").match(/filename="?([^";]+)/)?.[1] || "upscaled.png";
+    return { blob: await r.blob(), name, secs: (performance.now() - t0) / 1000 };
+  } finally {
+    running = false;
+    clearInterval(tick);
+  }
+}
+
+function setBar(done, total) {
+  if (total) { $("bar").max = total; $("bar").value = done; } else $("bar").removeAttribute("value");
+}
+
+$("go").onclick = () => files.length === 1 ? runSingle(files[0].file) : runBatch(files);
+
+async function runSingle(file) {
+  $("go").disabled = true;
+  $("status").className = "status";
+  $("bar").hidden = false; setBar();
+  try {
+    const res = await runOne(file, settings(), (text, d, n) => {
+      $("status").textContent = `Upscaling… ${text}`; setBar(d, n);
+    });
+    const url = URL.createObjectURL(res.blob);
     const before = URL.createObjectURL(file);
     $("before").src = before; $("after").src = url; $("full").src = url;
     $("dl").href = url;
-    $("dl").download = (r.headers.get("Content-Disposition") || "").match(/filename="?([^";]+)/)?.[1] || "upscaled.png";
+    $("dl").download = res.name;
     await $("full").decode();
     const o = new Image(); o.src = before; await o.decode();
     $("sizes").textContent = `${o.naturalWidth}×${o.naturalHeight} → ${$("full").naturalWidth}×${$("full").naturalHeight}`;
     $("result").hidden = false;
-    $("status").textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(1)}s`;
+    $("status").textContent = `Done in ${res.secs.toFixed(1)}s`;
   } catch (e) {
     $("status").className = "status err";
     $("status").textContent = "Error: " + e.message;
   } finally {
-    running = false;
-    clearInterval(tick);
     $("bar").hidden = true;
     $("go").disabled = false;
   }
-};
+}
+
+async function runBatch(list) {
+  const opts = settings();
+  const results = [];
+  stopRequested = false;
+  $("go").disabled = true;
+  $("stop").hidden = false; $("stop").disabled = false;
+  $("zip").disabled = true;
+  $("result").hidden = true;
+  $("batch").hidden = false;
+  $("status").className = "status";
+  $("bar").hidden = false;
+  $("rows").innerHTML = "";
+  const rows = list.map(({ file, path }) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="name"></td><td>${kb(file.size)}</td><td class="state">Waiting</td><td></td>`;
+    tr.cells[0].textContent = path;
+    $("rows").appendChild(tr);
+    return tr;
+  });
+  const t0 = performance.now();
+  let ok = 0, failed = 0;
+  for (let i = 0; i < list.length; i++) {
+    if (stopRequested) break;
+    const { file, path } = list[i];
+    const state = rows[i].cells[2];
+    state.textContent = "Working…";
+    setBar();
+    rows[i].scrollIntoView({ block: "nearest" });
+    try {
+      const res = await runOne(file, opts, (text, d, n) => {
+        state.textContent = text;
+        $("status").textContent = `Image ${i + 1} of ${list.length} · ${text}`;
+        setBar(d, n);
+      });
+      const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/") + 1) : "";
+      results.push({ path: dir + res.name, blob: res.blob });
+      state.textContent = `Done · ${res.secs.toFixed(1)}s · ${kb(res.blob.size)}`;
+      state.className = "state ok";
+      const a = document.createElement("a");
+      a.className = "dl"; a.textContent = "Download";
+      a.href = URL.createObjectURL(res.blob); a.download = res.name;
+      rows[i].cells[3].appendChild(a);
+      ok++;
+    } catch (e) {
+      state.textContent = "Error: " + e.message;
+      state.className = "state err";
+      failed++;
+    }
+    $("batchSummary").textContent = `${ok} done${failed ? ` · ${failed} failed` : ""} · ${list.length - ok - failed} left`;
+  }
+  for (const tr of rows) if (tr.cells[2].textContent === "Waiting") tr.cells[2].textContent = "Skipped";
+  const secs = Math.round((performance.now() - t0) / 1000);
+  $("status").textContent = `${stopRequested ? "Stopped" : "Finished"} · ${ok} of ${list.length} images in ${fmt(secs)}`;
+  $("batchSummary").textContent = `${ok} done${failed ? ` · ${failed} failed` : ""}`;
+  $("bar").hidden = true;
+  $("stop").hidden = true;
+  $("go").disabled = false;
+  if (results.length) {
+    $("zip").disabled = false;
+    $("zip").onclick = async () => {
+      const bytes = results.reduce((n, r) => n + r.blob.size, 0);
+      if (bytes > 4e9) {
+        $("status").textContent = "Too big for one ZIP (over 4 GB). Use the per-file Download links.";
+        return;
+      }
+      $("zip").disabled = true;
+      $("zip").textContent = "Building ZIP…";
+      try {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(await makeZip(results));
+        a.download = `upscaled_${results.length}_images.zip`;
+        a.click();
+      } finally {
+        $("zip").disabled = false;
+        $("zip").textContent = "Download all (ZIP)";
+      }
+    };
+  }
+}
+
+// Minimal ZIP writer (store only; PNGs are already compressed).
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+async function makeZip(entries) {
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const { path, blob } of entries) {
+    const data = new Uint8Array(await blob.arrayBuffer());
+    const name = enc.encode(path);
+    const crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30));
+    local.setUint32(0, 0x04034b50, true);
+    local.setUint16(4, 20, true);
+    local.setUint16(6, 0x0800, true);          // UTF-8 names
+    local.setUint32(14, crc, true);
+    local.setUint32(18, data.length, true);
+    local.setUint32(22, data.length, true);
+    local.setUint16(26, name.length, true);
+    parts.push(local, name, data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true);
+    cd.setUint16(4, 20, true);
+    cd.setUint16(6, 20, true);
+    cd.setUint16(8, 0x0800, true);
+    cd.setUint32(16, crc, true);
+    cd.setUint32(20, data.length, true);
+    cd.setUint32(24, data.length, true);
+    cd.setUint16(28, name.length, true);
+    cd.setUint32(42, offset, true);
+    central.push(cd, name);
+    offset += 30 + name.length + data.length;
+  }
+  const cdSize = central.reduce((n, p) => n + p.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, entries.length, true);
+  end.setUint16(10, entries.length, true);
+  end.setUint32(12, cdSize, true);
+  end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end], { type: "application/zip" });
+}
 </script>
 </body>
 </html>

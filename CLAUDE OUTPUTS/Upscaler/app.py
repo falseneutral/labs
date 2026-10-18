@@ -1,4 +1,5 @@
 """Real-ESRGAN image upscaler with background removal and a drag-and-drop web page."""
+import argparse
 import io
 import logging
 import os
@@ -157,11 +158,11 @@ def upscale_rgb(model, rgb, job=None):
 def upscale(img, model_name, outscale, job=None):
     if outscale == 1:
         return img
-    if job:
+    if job and model_name not in _models:
         _progress[job] = {"stage": "loading model"}
     model = load_model(model_name)
     alpha = img.getchannel("A") if img.mode in ("RGBA", "LA", "PA") else None
-    rgb = np.asarray(img.convert("RGB"))
+    rgb = np.array(img.convert("RGB"))
     result = Image.fromarray(upscale_rgb(model, rgb, job))
     target = (round(img.width * outscale), round(img.height * outscale))
     if result.size != target:
@@ -226,7 +227,65 @@ def api_upscale():
                      download_name=f"{stem}_x{outscale:g}{suffix}.png")
 
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+
+
+def run_batch(args):
+    """Upscale every image under args.batch into args.out, keeping subfolders."""
+    src = Path(args.batch).expanduser().resolve()
+    out = Path(args.out).expanduser().resolve() if args.out else src.with_name(src.name + "_upscaled")
+    images = sorted(p for p in src.rglob("*")
+                    if p.suffix.lower() in IMAGE_EXTS and not p.name.startswith(".")
+                    and out not in p.parents)
+    if not images:
+        raise SystemExit(f"No images found in {src}")
+    form = {"bg": args.bg, "bg_color": args.bg_color, "tolerance": args.tolerance,
+            "edges_only": "0" if args.all_colour else "1"}
+    suffix = "_transparent" if args.bg != "none" else ""
+    print(f"{len(images)} images · {args.model} · x{args.scale:g} · background: {args.bg}")
+    print(f"Output: {out}")
+    start, failed, skipped = time.time(), 0, 0
+    for i, path in enumerate(images, 1):
+        dest = out / path.relative_to(src).parent / f"{path.stem}_x{args.scale:g}{suffix}.png"
+        if dest.exists() and not args.overwrite:
+            print(f"[{i}/{len(images)}] skip (exists) {path.relative_to(src)}")
+            skipped += 1
+            continue
+        print(f"[{i}/{len(images)}] {path.relative_to(src)}", flush=True)
+        try:
+            img = Image.open(path)
+            img.load()
+            if args.bg != "none":
+                img = remove_background(img, form)
+            result = upscale(img, args.model, args.scale)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            result.save(dest, "PNG")
+        except Exception as e:
+            failed += 1
+            print(f"  failed: {e}")
+    done = len(images) - failed - skipped
+    print(f"Done in {time.time() - start:.0f}s · {done} upscaled · {skipped} skipped · {failed} failed")
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 7860))
-    print(f"Upscaler on http://localhost:{port} ({device.type})", flush=True)
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    parser = argparse.ArgumentParser(description="Real-ESRGAN upscaler. No arguments starts the web page.")
+    parser.add_argument("--batch", metavar="FOLDER", help="upscale every image in FOLDER (and subfolders)")
+    parser.add_argument("--out", metavar="FOLDER", help="output folder (default: FOLDER_upscaled)")
+    parser.add_argument("--model", choices=list(MODELS), default="photo-x4")
+    parser.add_argument("--scale", type=float, default=4, help="output scale 1-8 (default 4)")
+    parser.add_argument("--bg", choices=["none", "ai", "color"], default="none",
+                        help="remove background (default none)")
+    parser.add_argument("--bg-color", default="#ffffff", help="colour to remove with --bg color")
+    parser.add_argument("--tolerance", type=float, default=10, help="colour tolerance 0-60")
+    parser.add_argument("--all-colour", action="store_true",
+                        help="remove the colour everywhere, not just from the edges")
+    parser.add_argument("--overwrite", action="store_true", help="redo images already in the output folder")
+    args = parser.parse_args()
+    if args.batch:
+        if not 1 <= args.scale <= 8:
+            parser.error("--scale must be between 1 and 8")
+        run_batch(args)
+    else:
+        port = int(os.environ.get("PORT", 7860))
+        print(f"Upscaler on http://localhost:{port} ({device.type})", flush=True)
+        app.run(host="0.0.0.0", port=port, threaded=True)
