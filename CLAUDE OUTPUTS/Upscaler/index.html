@@ -30,6 +30,7 @@
   #drop.over { border-color: var(--accent); color: var(--text); }
   .status { min-height: 24px; margin: 12px 0; color: var(--muted); }
   .status.err { color: var(--error); }
+  progress { width: 100%; max-width: 480px; height: 8px; accent-color: var(--accent); display: block; margin-top: 6px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
   figure { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
   figcaption { font-size: 13px; color: var(--muted); margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
@@ -67,6 +68,7 @@
   <div id="drop">Drop image here or click to choose<br><small>PNG, JPG, WebP</small></div>
   <input id="file" type="file" accept="image/*" hidden>
   <div id="status" class="status"></div>
+  <progress id="bar" max="1" value="0" hidden></progress>
 
   <div id="result" class="grid" hidden>
     <figure>
@@ -99,6 +101,10 @@ $("file").onchange = e => pick(e.target.files[0]);
 $("drop").addEventListener("drop", e => pick(e.dataTransfer.files[0]));
 $("split").oninput = e => $("compare").style.setProperty("--split", e.target.value + "%");
 
+function fmt(s) {
+  return s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+}
+
 function pick(f) {
   if (!f || !f.type.startsWith("image/")) return;
   file = f;
@@ -111,11 +117,23 @@ $("go").onclick = async () => {
   fd.append("image", file);
   fd.append("model", $("model").value);
   fd.append("scale", $("scale").value);
+  const job = Math.random().toString(36).slice(2);
+  fd.append("job", job);
   $("go").disabled = true;
   $("status").className = "status";
   const t0 = performance.now();
-  const tick = setInterval(() => $("status").textContent =
-    `Upscaling… ${((performance.now() - t0) / 1000).toFixed(0)}s (first run downloads the model)`, 500);
+  $("bar").hidden = false; $("bar").removeAttribute("value");
+  const tick = setInterval(async () => {
+    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    let p = {};
+    try { p = await (await fetch(`/api/progress/${job}`)).json(); } catch {}
+    if (p.total) {
+      $("bar").max = p.total; $("bar").value = p.done;
+      $("status").textContent = `Upscaling… ${Math.round(100 * p.done / p.total)}% · tile ${p.done}/${p.total} · ~${fmt(p.eta)} left`;
+    } else {
+      $("status").textContent = `${p.stage === "loading model" ? "Loading model (first run downloads it)" : "Starting"}… ${secs}s`;
+    }
+  }, 1000);
   try {
     const r = await fetch("/api/upscale", { method: "POST", body: fd });
     if (!r.ok) {
@@ -138,6 +156,7 @@ $("go").onclick = async () => {
     $("status").textContent = "Error: " + e.message;
   } finally {
     clearInterval(tick);
+    $("bar").hidden = true;
     $("go").disabled = false;
   }
 };

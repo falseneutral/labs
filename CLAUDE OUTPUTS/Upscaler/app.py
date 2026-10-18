@@ -1,7 +1,9 @@
 """Real-ESRGAN image upscaler with a drag-and-drop web page."""
 import io
+import logging
 import os
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -36,8 +38,10 @@ def pick_device():
 device = pick_device()
 torch.set_num_threads(os.cpu_count() or 1)
 _models, _lock = {}, threading.Lock()
+_progress = {}
 app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 def load_model(name):
@@ -57,7 +61,7 @@ def load_model(name):
 
 
 @torch.inference_mode()
-def upscale_rgb(model, rgb):
+def upscale_rgb(model, rgb, job=None):
     """Run the model tile by tile so large images fit in memory."""
     scale = model.scale
     x = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).float().div(255).to(device)
@@ -66,6 +70,8 @@ def upscale_rgb(model, rgb):
     _, _, h, w = x.shape
     # Assemble on CPU as uint8 so huge outputs don't exhaust GPU memory.
     out = torch.zeros((3, h * scale, w * scale), dtype=torch.uint8)
+    total = -(-h // TILE) * -(-w // TILE)
+    done, start = 0, time.time()
     for y0 in range(0, h, TILE):
         for x0 in range(0, w, TILE):
             y1, x1 = min(y0 + TILE, h), min(x0 + TILE, w)
@@ -76,14 +82,22 @@ def upscale_rgb(model, rgb):
             tile = tile[0, :, oy:oy + (y1 - y0) * scale, ox:ox + (x1 - x0) * scale]
             out[:, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = (
                 tile.clamp(0, 1).mul(255).round().byte().cpu())
+            done += 1
+            eta = (time.time() - start) / done * (total - done)
+            if job:
+                _progress[job] = {"done": done, "total": total, "eta": round(eta)}
+            print(f"\r  tile {done}/{total} · ~{eta:.0f}s left   ", end="", flush=True)
+    print()
     return out.permute(1, 2, 0).numpy()
 
 
-def upscale(img, model_name, outscale):
+def upscale(img, model_name, outscale, job=None):
+    if job:
+        _progress[job] = {"stage": "loading model"}
     model = load_model(model_name)
     alpha = img.getchannel("A") if img.mode in ("RGBA", "LA", "PA") else None
     rgb = np.asarray(img.convert("RGB"))
-    result = Image.fromarray(upscale_rgb(model, rgb))
+    result = Image.fromarray(upscale_rgb(model, rgb, job))
     target = (round(img.width * outscale), round(img.height * outscale))
     if result.size != target:
         result = result.resize(target, Image.LANCZOS)
@@ -100,6 +114,11 @@ def index():
 @app.get("/api/info")
 def info():
     return {"device": device.type, "models": list(MODELS)}
+
+
+@app.get("/api/progress/<job>")
+def progress(job):
+    return _progress.get(job, {})
 
 
 @app.post("/api/upscale")
@@ -121,7 +140,13 @@ def api_upscale():
         abort(400, "Could not read image.")
     if img.width * img.height > MAX_INPUT_PX:
         abort(413, f"Image too large (max {MAX_INPUT_PX:,} pixels).")
-    result = upscale(img, model_name, outscale)
+    job = request.form.get("job")
+    print(f"Upscaling {file.filename} {img.width}x{img.height} "
+          f"with {model_name} to x{outscale:g}", flush=True)
+    try:
+        result = upscale(img, model_name, outscale, job)
+    finally:
+        _progress.pop(job, None)
     buf = io.BytesIO()
     result.save(buf, "PNG")
     buf.seek(0)
