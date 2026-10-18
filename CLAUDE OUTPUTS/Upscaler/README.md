@@ -25,7 +25,8 @@ Output scale 2/3/4: model runs at native scale, then resizes to target.
 
 - `PORT` (default 7860)
 - `TILE` tile size in px (default 256; lower = less memory)
-- `MAX_INPUT_PX` max input pixels (default 2048×2048)
+- `MAX_INPUT_PX` max input pixels (default 6000×6000)
+- `DEVICE` force `cpu`, `mps` or `cuda`
 - `WEIGHTS_DIR` where weights live
 
-GPU (CUDA) used automatically if present. CPU works, slower.
+Uses NVIDIA GPU (CUDA) or Apple Silicon GPU (MPS) automatically. CPU works, slower.

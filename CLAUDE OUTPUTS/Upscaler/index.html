@@ -118,7 +118,10 @@ $("go").onclick = async () => {
     `Upscaling… ${((performance.now() - t0) / 1000).toFixed(0)}s (first run downloads the model)`, 500);
   try {
     const r = await fetch("/api/upscale", { method: "POST", body: fd });
-    if (!r.ok) throw new Error((await r.text()).replace(/<[^>]+>/g, " ").trim() || r.statusText);
+    if (!r.ok) {
+      const html = await r.text();
+      throw new Error(html.match(/<p>(.*?)<\/p>/s)?.[1] || r.statusText);
+    }
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const before = URL.createObjectURL(file);

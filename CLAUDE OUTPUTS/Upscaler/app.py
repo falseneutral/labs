@@ -21,9 +21,19 @@ MODELS = {
 }
 TILE = int(os.environ.get("TILE", 256))
 PAD = 16
-MAX_INPUT_PX = int(os.environ.get("MAX_INPUT_PX", 2048 * 2048))
+MAX_INPUT_PX = int(os.environ.get("MAX_INPUT_PX", 6000 * 6000))
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def pick_device():
+    if os.environ.get("DEVICE"):
+        return torch.device(os.environ["DEVICE"])
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+device = pick_device()
 torch.set_num_threads(os.cpu_count() or 1)
 _models, _lock = {}, threading.Lock()
 app = Flask(__name__, static_folder=None)
@@ -54,7 +64,8 @@ def upscale_rgb(model, rgb):
     if device.type == "cuda":
         x = x.half()
     _, _, h, w = x.shape
-    out = torch.zeros((1, 3, h * scale, w * scale), dtype=x.dtype, device=device)
+    # Assemble on CPU as uint8 so huge outputs don't exhaust GPU memory.
+    out = torch.zeros((3, h * scale, w * scale), dtype=torch.uint8)
     for y0 in range(0, h, TILE):
         for x0 in range(0, w, TILE):
             y1, x1 = min(y0 + TILE, h), min(x0 + TILE, w)
@@ -62,10 +73,10 @@ def upscale_rgb(model, rgb):
             py1, px1 = min(y1 + PAD, h), min(x1 + PAD, w)
             tile = model(x[:, :, py0:py1, px0:px1])
             oy, ox = (y0 - py0) * scale, (x0 - px0) * scale
-            out[:, :, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = tile[
-                :, :, oy:oy + (y1 - y0) * scale, ox:ox + (x1 - x0) * scale]
-    out = out.clamp(0, 1).mul(255).round().byte().squeeze(0).permute(1, 2, 0)
-    return out.cpu().numpy()
+            tile = tile[0, :, oy:oy + (y1 - y0) * scale, ox:ox + (x1 - x0) * scale]
+            out[:, y0 * scale:y1 * scale, x0 * scale:x1 * scale] = (
+                tile.clamp(0, 1).mul(255).round().byte().cpu())
+    return out.permute(1, 2, 0).numpy()
 
 
 def upscale(img, model_name, outscale):
