@@ -3,3 +3,4 @@ spandrel
 flask
 pillow
 numpy
+packaging
