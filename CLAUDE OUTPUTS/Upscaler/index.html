@@ -40,6 +40,13 @@
   .compare .after { position: absolute; inset: 0; clip-path: inset(0 0 0 var(--split, 50%)); }
   .compare .after img { image-rendering: auto; }
   input[type=range] { width: 100%; }
+  .controls input[type=range] { width: 140px; }
+  input[type=color] { width: 44px; height: 38px; padding: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  label.check { display: flex; align-items: center; gap: 6px; padding-bottom: 9px; color: var(--text); }
+  .checker { background-color: #fff;
+    background-image: linear-gradient(45deg, #ccc 25%, transparent 25%), linear-gradient(-45deg, #ccc 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #ccc 75%), linear-gradient(-45deg, transparent 75%, #ccc 75%);
+    background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0; }
   a.dl { color: var(--accent); }
   [hidden] { display: none !important; }
 </style>
@@ -47,7 +54,7 @@
 <body>
 <main>
   <h1>Image Upscaler</h1>
-  <p class="sub">Real-ESRGAN, running locally. Drop an image, pick a model, upscale.</p>
+  <p class="sub">Real-ESRGAN, running locally. Drop an image, pick a model, upscale. Optionally remove the background for print.</p>
 
   <div class="controls">
     <label>Model
@@ -59,8 +66,25 @@
     </label>
     <label>Output scale
       <select id="scale">
+        <option value="1">1 (no upscale)</option>
         <option>2</option><option>3</option><option selected>4</option>
       </select>
+    </label>
+    <label>Background
+      <select id="bg">
+        <option value="none">Keep</option>
+        <option value="ai">Remove (AI)</option>
+        <option value="color">Remove colour</option>
+      </select>
+    </label>
+    <label class="colour-opt" hidden>Colour
+      <input id="bgColor" type="color" value="#ffffff">
+    </label>
+    <label class="colour-opt" hidden>Tolerance <span id="tolVal">10</span>
+      <input id="tol" type="range" min="0" max="60" value="10">
+    </label>
+    <label class="check colour-opt" hidden>
+      <input id="edges" type="checkbox" checked> Only from edges
     </label>
     <button id="go" class="primary" disabled>Upscale</button>
   </div>
@@ -73,15 +97,15 @@
   <div id="result" class="grid" hidden>
     <figure>
       <figcaption><span>Compare (drag slider)</span><span id="sizes"></span></figcaption>
-      <div class="compare" id="compare">
+      <div class="compare checker" id="compare">
         <img id="before" alt="Original">
-        <div class="after"><img id="after" alt="Upscaled"></div>
+        <div class="after checker"><img id="after" alt="Upscaled"></div>
       </div>
       <input id="split" type="range" min="0" max="100" value="50" aria-label="Comparison split">
     </figure>
     <figure>
       <figcaption><span>Upscaled</span><a id="dl" class="dl" download>Download PNG</a></figcaption>
-      <img id="full" alt="Upscaled result">
+      <div class="checker" style="border-radius:6px"><img id="full" alt="Upscaled result"></div>
     </figure>
   </div>
 </main>
@@ -94,6 +118,9 @@ fetch("/api/info").then(r => r.json()).then(i => {
 });
 
 $("model").onchange = () => { if ($("model").value === "photo-x2") $("scale").value = "2"; };
+$("bg").onchange = () => document.querySelectorAll(".colour-opt")
+  .forEach(el => el.hidden = $("bg").value !== "color");
+$("tol").oninput = () => $("tolVal").textContent = $("tol").value;
 $("drop").onclick = () => $("file").click();
 $("file").onchange = e => pick(e.target.files[0]);
 ["dragover", "dragenter"].forEach(t => $("drop").addEventListener(t, e => { e.preventDefault(); $("drop").classList.add("over"); }));
@@ -117,21 +144,29 @@ $("go").onclick = async () => {
   fd.append("image", file);
   fd.append("model", $("model").value);
   fd.append("scale", $("scale").value);
+  fd.append("bg", $("bg").value);
+  fd.append("bg_color", $("bgColor").value);
+  fd.append("tolerance", $("tol").value);
+  fd.append("edges_only", $("edges").checked ? "1" : "0");
   const job = Math.random().toString(36).slice(2);
   fd.append("job", job);
   $("go").disabled = true;
   $("status").className = "status";
   const t0 = performance.now();
   $("bar").hidden = false; $("bar").removeAttribute("value");
+  let running = true;
   const tick = setInterval(async () => {
     const secs = ((performance.now() - t0) / 1000).toFixed(0);
     let p = {};
     try { p = await (await fetch(`/api/progress/${job}`)).json(); } catch {}
+    if (!running) return;
     if (p.total) {
       $("bar").max = p.total; $("bar").value = p.done;
       $("status").textContent = `Upscaling… ${Math.round(100 * p.done / p.total)}% · tile ${p.done}/${p.total} · ~${fmt(p.eta)} left`;
     } else {
-      $("status").textContent = `${p.stage === "loading model" ? "Loading model (first run downloads it)" : "Starting"}… ${secs}s`;
+      const stage = { "loading model": "Loading model (first run downloads it)",
+                      "removing background": "Removing background (first AI run downloads 170 MB)" }[p.stage] || "Starting";
+      $("status").textContent = `${stage}… ${secs}s`;
     }
   }, 1000);
   try {
@@ -155,6 +190,7 @@ $("go").onclick = async () => {
     $("status").className = "status err";
     $("status").textContent = "Error: " + e.message;
   } finally {
+    running = false;
     clearInterval(tick);
     $("bar").hidden = true;
     $("go").disabled = false;

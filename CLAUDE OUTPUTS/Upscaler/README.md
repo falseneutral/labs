@@ -20,6 +20,17 @@ Open http://localhost:7860. Model weights download to `weights/` on first use.
 | Anime x4 | Illustrations, line art, anime |
 
 Output scale 2/3/4: model runs at native scale, then resizes to target.
+Output scale 1 skips upscaling (background removal only).
+
+## Background removal (for print)
+
+| Option | Use for |
+|---|---|
+| Remove (AI) | Photos, any background. ISNet model, 170 MB, downloads on first use |
+| Remove colour | Logos, scans, flat backgrounds. Pick colour + tolerance |
+
+"Only from edges" keeps matching colour inside the subject (e.g. white in a logo).
+Output is a transparent PNG (`*_transparent.png`).
 
 ## Settings (env vars)
 

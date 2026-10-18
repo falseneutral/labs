@@ -1,4 +1,4 @@
-"""Real-ESRGAN image upscaler with a drag-and-drop web page."""
+"""Real-ESRGAN image upscaler with background removal and a drag-and-drop web page."""
 import io
 import logging
 import os
@@ -9,8 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import onnxruntime as ort
 from flask import Flask, abort, request, send_file, send_from_directory
-from PIL import Image
+from PIL import Image, ImageColor, ImageFilter
+from scipy import ndimage
 from spandrel import ModelLoader
 
 BASE = Path(__file__).parent
@@ -21,6 +23,8 @@ MODELS = {
     "photo-x2": f"{RELEASES}/v0.2.1/RealESRGAN_x2plus.pth",
     "anime-x4": f"{RELEASES}/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth",
 }
+BG_MODEL = ("https://github.com/danielgatis/rembg/releases/download/v0.0.0/"
+            "isnet-general-use.onnx")
 TILE = int(os.environ.get("TILE", 256))
 PAD = 16
 MAX_INPUT_PX = int(os.environ.get("MAX_INPUT_PX", 6000 * 6000))
@@ -44,20 +48,79 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
+def fetch_weights(url):
+    path = WEIGHTS / url.rsplit("/", 1)[1]
+    if not path.exists():
+        WEIGHTS.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading {path.name} ...", flush=True)
+        urllib.request.urlretrieve(url, path)
+    return path
+
+
 def load_model(name):
     with _lock:
         if name not in _models:
-            url = MODELS[name]
-            path = WEIGHTS / url.rsplit("/", 1)[1]
-            if not path.exists():
-                WEIGHTS.mkdir(parents=True, exist_ok=True)
-                print(f"Downloading {path.name} ...", flush=True)
-                urllib.request.urlretrieve(url, path)
+            path = fetch_weights(MODELS[name])
             model = ModelLoader().load_from_file(str(path)).eval().to(device)
             if device.type == "cuda":
                 model = model.half()
             _models[name] = model
         return _models[name]
+
+
+def ai_mask(img):
+    """Foreground mask from the ISNet background-removal model."""
+    with _lock:
+        if "bg" not in _models:
+            _models["bg"] = ort.InferenceSession(
+                str(fetch_weights(BG_MODEL)), providers=["CPUExecutionProvider"])
+        session = _models["bg"]
+    x = np.asarray(img.convert("RGB").resize((1024, 1024), Image.LANCZOS), np.float32)
+    x = x / max(x.max(), 1e-6) - np.array([0.485, 0.456, 0.406], np.float32)
+    x = x.transpose(2, 0, 1)[None]
+    pred = session.run(None, {session.get_inputs()[0].name: x})[0][0, 0]
+    pred = (pred - pred.min()) / max(pred.max() - pred.min(), 1e-6)
+    mask = Image.fromarray((pred * 255).astype(np.uint8), "L")
+    return mask.resize(img.size, Image.LANCZOS)
+
+
+def color_mask(img, color, tolerance, edges_only):
+    """Mask out pixels close to `color`; optionally only regions touching the border."""
+    rgb = np.asarray(img.convert("RGB"), np.float32)
+    dist = np.linalg.norm(rgb - np.array(color, np.float32), axis=2) / np.sqrt(3 * 255 ** 2)
+    tol = tolerance / 100
+    feather = max(tol * 0.5, 0.02)
+    # 0 = background colour, 1 = keep; soft ramp between tol and tol + feather.
+    alpha = np.clip((dist - tol) / feather, 0, 1)
+    if edges_only:
+        labels, _ = ndimage.label(alpha < 1)
+        border = np.unique(np.concatenate(
+            [labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        bg = np.isin(labels, border[border > 0])
+        alpha = np.where(bg, alpha, 1)
+    mask = Image.fromarray((alpha * 255).astype(np.uint8), "L")
+    # Slight blur hides the stair-stepping on hard edges.
+    return mask.filter(ImageFilter.GaussianBlur(0.6))
+
+
+def remove_background(img, form):
+    mode = form.get("bg", "none")
+    if mode == "ai":
+        mask = ai_mask(img)
+    elif mode == "color":
+        try:
+            color = ImageColor.getrgb(form.get("bg_color", "#ffffff"))[:3]
+            tolerance = float(form.get("tolerance", 10))
+        except ValueError:
+            abort(400, "Bad colour or tolerance.")
+        mask = color_mask(img, color, tolerance, form.get("edges_only") == "1")
+    else:
+        return img
+    if img.mode in ("RGBA", "LA", "PA"):
+        mask = Image.fromarray(np.minimum(np.asarray(mask), np.asarray(img.getchannel("A"))))
+    img = img.convert("RGB")
+    img.putalpha(mask)
+    return img
 
 
 @torch.inference_mode()
@@ -92,6 +155,8 @@ def upscale_rgb(model, rgb, job=None):
 
 
 def upscale(img, model_name, outscale, job=None):
+    if outscale == 1:
+        return img
     if job:
         _progress[job] = {"stage": "loading model"}
     model = load_model(model_name)
@@ -144,6 +209,11 @@ def api_upscale():
     print(f"Upscaling {file.filename} {img.width}x{img.height} "
           f"with {model_name} to x{outscale:g}", flush=True)
     try:
+        if request.form.get("bg", "none") != "none":
+            if job:
+                _progress[job] = {"stage": "removing background"}
+            print("  removing background ...", flush=True)
+            img = remove_background(img, request.form)
         result = upscale(img, model_name, outscale, job)
     finally:
         _progress.pop(job, None)
@@ -151,8 +221,9 @@ def api_upscale():
     result.save(buf, "PNG")
     buf.seek(0)
     stem = Path(file.filename or "image").stem
+    suffix = "_transparent" if request.form.get("bg", "none") != "none" else ""
     return send_file(buf, mimetype="image/png",
-                     download_name=f"{stem}_x{outscale:g}.png")
+                     download_name=f"{stem}_x{outscale:g}{suffix}.png")
 
 
 if __name__ == "__main__":
